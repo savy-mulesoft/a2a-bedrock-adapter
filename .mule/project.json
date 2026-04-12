@@ -1,0 +1,10 @@
+{
+  "modelVersion": "1.0.0",
+  "name": "a2a-bedrock-adapter",
+  "version": "1.0.0-SNAPSHOT",
+  "source": "file:///Users/sarvarth.bhatnagar/a2a-bedrock-adapter/pom.xml",
+  "natures": [
+    "mule"
+  ],
+  "components": []
+}

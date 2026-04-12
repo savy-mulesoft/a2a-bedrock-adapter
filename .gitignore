@@ -1,0 +1,10 @@
+target/
+# Local secrets — copy config.properties.example to config.properties
+src/main/resources/config.properties
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+.tooling-project

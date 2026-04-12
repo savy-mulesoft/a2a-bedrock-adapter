@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:java="http://www.mulesoft.org/schema/mule/java"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/java http://www.mulesoft.org/schema/mule/java/current/mule-java.xsd">
+
+  <configuration-properties file="config.properties"/>
+
+  <http:listener-config name="HTTP_Listener_config">
+    <http:listener-connection host="0.0.0.0" port="${http.listener.port}"/>
+  </http:listener-config>
+
+  <http:listener-config name="A2A_HTTP_Listener_config">
+    <http:listener-connection host="0.0.0.0" port="${a2a.listener.port}"/>
+  </http:listener-config>
+
+  <!--
+    Required shape (native interceptor) when supported by your HTTP connector build:
+    <http:request-config name="Bedrock_Request_config">
+      <http:request-connection
+          protocol="HTTPS"
+          host="#['bedrock-agent-runtime.' ++ p('aws.region') ++ '.amazonaws.com']"
+          port="443"
+          streamResponse="false"
+          responseBufferSize="10485760">
+        <http:aws-v4-authentication
+            accessKey="${aws.accessKey}"
+            secretKey="${aws.secretKey}"
+            region="${aws.region}"
+            serviceName="bedrock"/>
+      </http:request-connection>
+    </http:request-config>
+    Public Maven artifacts for mule-http-connector through 1.11.x do not include this element; SigV4 is applied via AwsSigV4HttpHeaders + java:invoke-static below.
+  -->
+  <http:request-config name="Bedrock_Request_config">
+    <http:request-connection
+        protocol="HTTPS"
+        host="#['bedrock-agent-runtime.' ++ p('aws.region') ++ '.amazonaws.com']"
+        port="443"
+        streamResponse="false"
+        responseBufferSize="10485760"/>
+  </http:request-config>
+
+  <a2a:server-config name="A2A_Server">
+    <a2a:connection listenerConfig="A2A_HTTP_Listener_config" agentPath="${agent.path}"/>
+    <a2a:card name="${agent.name}" url="${agent.host}${agent.path}" version="${agent.version}">
+      <a2a:description><![CDATA[${agent.description}]]></a2a:description>
+      <a2a:skills>
+        <a2a:agent-skill id="${agent.skill.1.id}" name="${agent.skill.1.name}">
+          <a2a:description><![CDATA[${agent.skill.1.description}]]></a2a:description>
+          <a2a:tags>
+            <a2a:tag value="bedrock"/>
+            <a2a:tag value="aws"/>
+          </a2a:tags>
+        </a2a:agent-skill>
+      </a2a:skills>
+    </a2a:card>
+  </a2a:server-config>
+
+  <flow name="a2a-bedrock-listener">
+    <a2a:task-listener config-ref="A2A_Server" doc:name="A2A Listener"/>
+    <flow-ref name="bedrock-agent-processor"/>
+  </flow>
+
+  <flow name="bedrock-agent-processor">
+    <logger level="INFO" message="A2A task received: id=#[payload.id] sessionId=#[payload.sessionId]"/>
+
+    <ee:transform doc:name="Session and JSON-RPC correlation">
+      <ee:variables>
+        <ee:set-variable variableName="originalRequest"><![CDATA[%dw 2.0
+output application/java
+---
+{ id: correlationId as String }
+]]></ee:set-variable>
+        <ee:set-variable variableName="a2aSessionId"><![CDATA[%dw 2.0
+output application/java
+---
+(payload.sessionId default correlationId) as String
+]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <ee:transform doc:name="Bedrock URL path">
+      <ee:variables>
+        <ee:set-variable variableName="bedrockPath"><![CDATA[%dw 2.0
+output application/java
+---
+'/agents/' ++ p('aws.agent.id') ++ '/agentAliases/' ++ p('aws.alias.id') ++ '/sessions/' ++ (vars.a2aSessionId as String) ++ '/text'
+]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <ee:transform doc:name="Bedrock request body">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var firstText = (payload.message.parts filter ((part) -> part.'kind' == "text"))[0].text default ""
+---
+{
+    "inputText": firstText
+}
+]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <ee:transform doc:name="Canonical JSON string for SigV4 body (var)">
+      <ee:variables>
+        <ee:set-variable variableName="bedrockJsonString"><![CDATA[%dw 2.0
+output application/java
+---
+write(payload, "application/json")
+]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <ee:transform doc:name="Payload as exact JSON string for HTTP body">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+vars.bedrockJsonString
+]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <java:invoke-static
+        class="com.mulesoft.a2a.bedrock.AwsSigV4HttpHeaders"
+        method="signPost(String,String,String,String,String,String,String)"
+        target="bedrockAuthHeaders"
+        doc:name="AWS SigV4 headers">
+      <java:args><![CDATA[#[%dw 2.0
+output application/java
+---
+{
+  region: p("aws.region"),
+  serviceSigningName: p("aws.service.signing.name"),
+  accessKey: p("aws.accessKey"),
+  secretKey: p("aws.secretKey"),
+  path: vars.bedrockPath,
+  bodyJson: vars.bedrockJsonString,
+  sessionToken: p("aws.sessionToken") default ""
+}]]]></java:args>
+    </java:invoke-static>
+
+    <http:request
+        config-ref="Bedrock_Request_config"
+        method="POST"
+        path="#[vars.bedrockPath]"
+        doc:name="Invoke Bedrock Agent Runtime">
+      <http:headers><![CDATA[#[vars.bedrockAuthHeaders]]]></http:headers>
+    </http:request>
+
+    <ee:transform doc:name="Event stream Base64 to A2A JSON-RPC">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+import fromBase64 from dw::core::Binaries
+
+// Cast the raw AWS Event Stream to a String
+var rawResponse = payload as String default ""
+
+// Scan the stream for all chunks containing "bytes":"<base64_string>"
+var matches = rawResponse scan /"bytes"\s*:\s*"([^"]+)"/
+
+// Decode every matched chunk and join them together into the final plain-text answer
+var decodedText = (matches map ((m) -> fromBase64(m[1] as String) as String)) joinBy ""
+
+---
+{
+  "jsonrpc": "2.0",
+  "id": vars.originalRequest.id default "1",
+  "result": {
+    "status": {
+      "state": "completed"
+    },
+    "sessionId": vars.a2aSessionId,
+    "message": {
+      "role": "model",
+      "parts": [
+        {
+          "kind": "text",
+          "text": if (isEmpty(decodedText)) "Error: No data returned from Bedrock Agent stream." else decodedText
+        }
+      ]
+    }
+  }
+}
+]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO" message="Bedrock adapter completed for session #[vars.a2aSessionId]"/>
+  </flow>
+</mule>

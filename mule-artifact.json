@@ -1,0 +1,10 @@
+{
+  "minMuleVersion": "4.10.0",
+  "javaSpecificationVersions": [
+    "17"
+  ],
+  "name": "A2A Bedrock Adapter",
+  "description": "A2A server adapter that invokes AWS Bedrock Agents via HTTPS with AWS Signature Version 4 and parses event-stream responses",
+  "version": "1.0.0",
+  "classifier": "mule-application"
+}

@@ -23,32 +23,7 @@
     <http:listener-connection host="0.0.0.0" port="${a2a.listener.port}"/>
   </http:listener-config>
 
-  <!--
-    Required shape (native interceptor) when supported by your HTTP connector build:
-    <http:request-config name="Bedrock_Request_config">
-      <http:request-connection
-          protocol="HTTPS"
-          host="#['bedrock-agent-runtime.' ++ p('aws.region') ++ '.amazonaws.com']"
-          port="443"
-          streamResponse="false"
-          responseBufferSize="10485760">
-        <http:aws-v4-authentication
-            accessKey="${aws.accessKey}"
-            secretKey="${aws.secretKey}"
-            region="${aws.region}"
-            serviceName="bedrock"/>
-      </http:request-connection>
-    </http:request-config>
-    Public Maven artifacts for mule-http-connector through 1.11.x do not include this element; SigV4 is applied via AwsSigV4HttpHeaders + java:invoke-static below.
-  -->
-  <http:request-config name="Bedrock_Request_config">
-    <http:request-connection
-        protocol="HTTPS"
-        host="#['bedrock-agent-runtime.' ++ p('aws.region') ++ '.amazonaws.com']"
-        port="443"
-        streamResponse="false"
-        responseBufferSize="10485760"/>
-  </http:request-config>
+  <!-- Bedrock Agent Runtime is called from Java (BedrockAgentInvoker) so the event-stream body stays binary. -->
 
   <a2a:server-config name="A2A_Server">
     <a2a:connection listenerConfig="A2A_HTTP_Listener_config" agentPath="${agent.path}"/>
@@ -74,13 +49,8 @@
   <flow name="bedrock-agent-processor">
     <logger level="INFO" message="A2A task received: id=#[payload.id] sessionId=#[payload.sessionId]"/>
 
-    <ee:transform doc:name="Session and JSON-RPC correlation">
+    <ee:transform doc:name="Session id">
       <ee:variables>
-        <ee:set-variable variableName="originalRequest"><![CDATA[%dw 2.0
-output application/java
----
-{ id: correlationId as String }
-]]></ee:set-variable>
         <ee:set-variable variableName="a2aSessionId"><![CDATA[%dw 2.0
 output application/java
 ---
@@ -99,99 +69,66 @@ output application/java
       </ee:variables>
     </ee:transform>
 
-    <ee:transform doc:name="Bedrock request body">
-      <ee:message>
-        <ee:set-payload><![CDATA[%dw 2.0
-output application/json
-var firstText = (payload.message.parts filter ((part) -> part.'kind' == "text"))[0].text default ""
----
-{
-    "inputText": firstText
-}
-]]></ee:set-payload>
-      </ee:message>
-    </ee:transform>
-
-    <ee:transform doc:name="Canonical JSON string for SigV4 body (var)">
+    <ee:transform doc:name="User prompt text for Bedrock">
       <ee:variables>
-        <ee:set-variable variableName="bedrockJsonString"><![CDATA[%dw 2.0
+        <ee:set-variable variableName="userPromptText"><![CDATA[%dw 2.0
 output application/java
 ---
-write(payload, "application/json")
+((payload.message.parts filter ((part) -> part.'kind' == "text"))[0].text default "") as String
 ]]></ee:set-variable>
       </ee:variables>
     </ee:transform>
 
-    <ee:transform doc:name="Payload as exact JSON string for HTTP body">
-      <ee:message>
-        <ee:set-payload><![CDATA[%dw 2.0
-output application/java
----
-vars.bedrockJsonString
-]]></ee:set-payload>
-      </ee:message>
-    </ee:transform>
-
     <java:invoke-static
-        class="com.mulesoft.a2a.bedrock.AwsSigV4HttpHeaders"
-        method="signPost(String,String,String,String,String,String,String)"
-        target="bedrockAuthHeaders"
-        doc:name="AWS SigV4 headers">
+        class="com.mulesoft.a2a.bedrock.BedrockAgentInvoker"
+        method="invokeAgent(String,String,String,String,String,String,String)"
+        target="bedrockOutcome"
+        doc:name="Invoke Bedrock Agent (SigV4 + event stream decode)">
       <java:args><![CDATA[#[%dw 2.0
 output application/java
 ---
 {
-  region: p("aws.region"),
-  serviceSigningName: p("aws.service.signing.name"),
-  accessKey: p("aws.accessKey"),
-  secretKey: p("aws.secretKey"),
-  path: vars.bedrockPath,
-  bodyJson: vars.bedrockJsonString,
-  sessionToken: p("aws.sessionToken") default ""
+  arg0: p("aws.region"),
+  arg1: p("aws.accessKey"),
+  arg2: p("aws.secretKey"),
+  arg3: p("aws.agent.id"),
+  arg4: p("aws.alias.id"),
+  arg5: vars.a2aSessionId,
+  arg6: vars.userPromptText
 }]]]></java:args>
     </java:invoke-static>
 
-    <http:request
-        config-ref="Bedrock_Request_config"
-        method="POST"
-        path="#[vars.bedrockPath]"
-        doc:name="Invoke Bedrock Agent Runtime">
-      <http:headers><![CDATA[#[vars.bedrockAuthHeaders]]]></http:headers>
-    </http:request>
-
-    <ee:transform doc:name="Event stream Base64 to A2A JSON-RPC">
+    <ee:transform doc:name="A2A SendMessage response (root kind=message)">
       <ee:message>
         <ee:set-payload><![CDATA[%dw 2.0
 output application/json
-import fromBase64 from dw::core::Binaries
-
-// Cast the raw AWS Event Stream to a String
-var rawResponse = payload as String default ""
-
-// Scan the stream for all chunks containing "bytes":"<base64_string>"
-var matches = rawResponse scan /"bytes"\s*:\s*"([^"]+)"/
-
-// Decode every matched chunk and join them together into the final plain-text answer
-var decodedText = (matches map ((m) -> fromBase64(m[1] as String) as String)) joinBy ""
-
+var o = vars.bedrockOutcome
+var textOut = o.aggregatedText default ""
+var isErr = (o.errorCode != null)
+var partText =
+  if (isErr)
+    ("[error -32603] " ++ (o.errorMessage default "Bedrock invocation failed"))
+  else if (isEmpty(textOut))
+    "Error: No data returned from Bedrock Agent stream."
+  else
+    textOut
 ---
 {
-  "jsonrpc": "2.0",
-  "id": vars.originalRequest.id default "1",
-  "result": {
-    "status": {
-      "state": "completed"
-    },
-    "sessionId": vars.a2aSessionId,
-    "message": {
-      "role": "model",
-      "parts": [
-        {
-          "kind": "text",
-          "text": if (isEmpty(decodedText)) "Error: No data returned from Bedrock Agent stream." else decodedText
-        }
-      ]
-    }
+  "kind": "message",
+  "status": {
+    "state": if (isErr) "failed" else "completed"
+  },
+  "sessionId": vars.a2aSessionId,
+  "message": {
+    "kind": "message",
+    "messageId": correlationId as String,
+    "role": "model",
+    "parts": [
+      {
+        "kind": "text",
+        "text": partText
+      }
+    ]
   }
 }
 ]]></ee:set-payload>

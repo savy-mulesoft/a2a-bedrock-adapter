@@ -2,7 +2,6 @@ package com.mulesoft.a2a.bedrock;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
-import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.signer.Aws4Signer;
 import software.amazon.awssdk.auth.signer.params.Aws4SignerParams;
 import software.amazon.awssdk.http.ContentStreamProvider;
@@ -18,8 +17,7 @@ import java.util.Map;
 /**
  * Produces SigV4-signed headers for HTTPS calls to Amazon Bedrock Agent Runtime.
  * <p>
- * {@code serviceSigningName} is typically {@code "bedrock"} for Bedrock Agent Runtime (same as Postman "Service Name").
- * Use {@code AwsSessionCredentials} when {@code sessionToken} is set (temporary / ASIA* keys).
+ * Expects a long-lived IAM user access key ({@code AKIA*}). Temporary {@code ASIA*} keys are rejected.
  */
 public final class AwsSigV4HttpHeaders {
 
@@ -31,17 +29,17 @@ public final class AwsSigV4HttpHeaders {
             String accessKey,
             String secretKey,
             String path,
-            String bodyJson,
-            String sessionToken) {
+            String bodyJson) {
 
         if (accessKey == null || accessKey.isEmpty() || secretKey == null || secretKey.isEmpty()) {
             throw new IllegalArgumentException("aws.accessKey and aws.secretKey must be non-empty");
         }
+        if (accessKey.startsWith("ASIA")) {
+            throw new IllegalArgumentException(
+                    "Use a long-lived IAM user access key (AKIA*), not a temporary ASIA* key.");
+        }
 
-        String host = "bedrock-agent-runtime." + region + ".amazonaws.com";
-        AwsCredentials creds = (sessionToken != null && !sessionToken.isEmpty())
-                ? AwsSessionCredentials.create(accessKey, secretKey, sessionToken)
-                : AwsBasicCredentials.create(accessKey, secretKey);
+        AwsCredentials creds = AwsBasicCredentials.create(accessKey, secretKey);
 
         Aws4SignerParams params = Aws4SignerParams.builder()
                 .awsCredentials(creds)
@@ -49,6 +47,7 @@ public final class AwsSigV4HttpHeaders {
                 .signingRegion(Region.of(region))
                 .build();
 
+        String host = "bedrock-agent-runtime." + region + ".amazonaws.com";
         byte[] bodyBytes = bodyJson.getBytes(StandardCharsets.UTF_8);
         ContentStreamProvider bodyProvider = () -> new ByteArrayInputStream(bodyBytes);
 

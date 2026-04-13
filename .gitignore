@@ -1,5 +1,5 @@
 target/
-# Local secrets — copy config.properties.example to config.properties
+# Local secrets
 src/main/resources/config.properties
 .idea/
 *.iml

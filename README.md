@@ -106,4 +106,4 @@ Adjust **`agent.path`** and port if you changed them in `config.properties`.
 
 ## Further reading
 
-See **`learnings.readme`** in this repo for deeper notes (SigV4 scope, event stream, A2A connector expectations).
+See **[`docs/technical-learnings.md`](docs/technical-learnings.md)** for deeper notes (SigV4 scope, event stream, A2A connector expectations).
